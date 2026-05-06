@@ -40,25 +40,64 @@ actor UnzipService {
 
     /// 解压文件
     /// - Parameters:
-    ///   - archivePath: .7z 文件路径
+    ///   - archivePath: 压缩文件路径
     ///   - outputPath: 输出目录路径
-    ///   - password: 可选密码
+    ///   - password: 可选密码（仅 7z/rar 格式生效）
     /// - Returns: 解压出的文件/文件夹列表
     func extract(
         archivePath: String,
         outputPath: String,
         password: String? = nil
     ) async throws -> [String] {
-        let sevenZ = try locateSevenZ()
-
         // 确保输出目录存在
         try FileManager.default.createDirectory(
             atPath: outputPath,
             withIntermediateDirectories: true
         )
 
-        // -aou 遇同名自动重命名 / -bb1 详细输出计数
-        var args = ["x", archivePath, "-o" + outputPath, "-aou", "-bb1"]
+        let lower = archivePath.lowercased()
+        let hasPassword = password.map { !$0.isEmpty } ?? false
+
+        // 有密码 → 只有 7z 能处理（系统原生工具不支持密码）
+        if !hasPassword {
+            // ZIP → ditto（最快，不损坏 .app 签名）
+            if lower.hasSuffix(".zip") {
+                return try runNativeExtractor("/usr/bin/ditto", args: ["-xk", archivePath, outputPath],
+                                              name: "ditto", outputDir: outputPath)
+            }
+
+            // tar 系列 → 系统 tar（自动检测压缩算法）
+            if isTarLike(lower) {
+                return try runNativeExtractor("/usr/bin/tar", args: ["-xf", archivePath, "-C", outputPath],
+                                              name: "tar", outputDir: outputPath)
+            }
+
+            // 单文件 .gz → gunzip
+            if lower.hasSuffix(".gz") {
+                let stem = String((archivePath as NSString).lastPathComponent.dropLast(3))
+                return try decompressStandalone(archivePath: archivePath, outputPath: outputPath,
+                                                outputName: stem, tool: "/usr/bin/gunzip", args: ["-c"])
+            }
+
+            // 单文件 .bz2 → bunzip2
+            if lower.hasSuffix(".bz2") {
+                let stem = String((archivePath as NSString).lastPathComponent.dropLast(4))
+                return try decompressStandalone(archivePath: archivePath, outputPath: outputPath,
+                                                outputName: stem, tool: "/usr/bin/bunzip2", args: ["-c"])
+            }
+
+            // 单文件 .xz → xz
+            if lower.hasSuffix(".xz") {
+                let stem = String((archivePath as NSString).lastPathComponent.dropLast(3))
+                return try decompressStandalone(archivePath: archivePath, outputPath: outputPath,
+                                                outputName: stem, tool: "/usr/bin/xz", args: ["-d", "-c"])
+            }
+        }
+
+        // 其余格式（7z / rar）走 7z
+        let sevenZ = try locateSevenZ()
+
+        var args = ["x", archivePath, "-o" + outputPath, "-aou"]
 
         if let pwd = password, !pwd.isEmpty {
             args.append("-p" + pwd)
@@ -66,12 +105,70 @@ actor UnzipService {
             args.append("-p")  // 不加 -p 加密 zip/7z 会挂死等交互输入
         }
 
-        // 执行 7z 命令
         let output = try await shellWithProgress(sevenZ, args)
-
-        // 解析输出，提取解压出的文件名
         let files = parseOutput(output, basePath: outputPath)
         return files
+    }
+
+    /// 判断是否可用系统原生工具解压（不支持密码，无需 7z 预检）
+    static func isNativeFormat(_ path: String) -> Bool {
+        let lower = path.lowercased()
+        if lower.hasSuffix(".zip") { return true }
+        if lower.hasSuffix(".7z") || lower.hasSuffix(".rar") { return false }
+        // tar / gz / bz2 / xz 都可用系统工具
+        return lower.hasSuffix(".tar") || lower.hasSuffix(".gz") ||
+               lower.hasSuffix(".bz2") || lower.hasSuffix(".xz") ||
+               lower.hasSuffix(".tgz") || lower.hasSuffix(".tbz2") || lower.hasSuffix(".txz")
+    }
+
+    // MARK: - Private helpers
+
+    /// 检查是否为 tar 系列格式
+    private func isTarLike(_ lower: String) -> Bool {
+        lower.hasSuffix(".tar") || lower.hasSuffix(".tar.gz") || lower.hasSuffix(".tgz") ||
+        lower.hasSuffix(".tar.bz2") || lower.hasSuffix(".tbz2") ||
+        lower.hasSuffix(".tar.xz") || lower.hasSuffix(".txz")
+    }
+
+    /// 运行系统原生解压工具，返回输出目录中的条目列表
+    nonisolated private func runNativeExtractor(_ tool: String, args: [String],
+                                                 name: String, outputDir: String) throws -> [String] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: tool)
+        process.arguments = args
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        if process.terminationStatus != 0 {
+            throw UnzipError.extractionFailed(message: "\(name) 解压失败")
+        }
+        return listExtractedItems(in: outputDir)
+    }
+
+    /// 解压单文件格式（.gz / .bz2 / .xz），输出到指定文件名
+    nonisolated private func decompressStandalone(archivePath: String, outputPath: String,
+                                                   outputName: String, tool: String,
+                                                   args toolArgs: [String]) throws -> [String] {
+        let outFile = outputPath + "/" + outputName
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        let escapedIn = archivePath.replacingOccurrences(of: "'", with: "'\\''")
+        let escapedOut = outFile.replacingOccurrences(of: "'", with: "'\\''")
+        process.arguments = ["-c", "\(tool) \(toolArgs.joined(separator: " ")) '\(escapedIn)' > '\(escapedOut)'"]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        if process.terminationStatus != 0 {
+            throw UnzipError.extractionFailed(message: "\(tool) 解压失败")
+        }
+        return [outputName]
+    }
+
+    /// 列出目录中的条目
+    nonisolated private func listExtractedItems(in directory: String) -> [String] {
+        (try? FileManager.default.contentsOfDirectory(atPath: directory))?.sorted() ?? []
     }
 
     /// 递归搜索目录中匹配扩展名的压缩文件
@@ -137,62 +234,53 @@ actor UnzipService {
         guard let sevenZ = try? locateSevenZ() else { return nil }
         return await withCheckedContinuation { cont in
             DispatchQueue.global().async {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: sevenZ)
-                process.arguments = ["l", path, "-slt"]
-                let pipe = Pipe()
-                process.standardOutput = pipe
-                process.standardError = Pipe()
-                do {
-                    try process.run()
-                    process.waitUntilExit()
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    let output = String(data: data, encoding: .utf8) ?? ""
-                    var total: UInt64 = 0
-                    for line in output.components(separatedBy: .newlines) {
-                        if line.hasPrefix("Size = ") {
-                            let numStr = line.replacingOccurrences(of: "Size = ", with: "").trimmingCharacters(in: .whitespaces)
-                            if let s = UInt64(numStr) { total += s }
-                        }
-                    }
-                    cont.resume(returning: total > 0 ? total : nil)
-                } catch {
-                    cont.resume(returning: nil)
+                guard let result = self.runWithTimeout(executable: sevenZ, arguments: ["l", path, "-slt"], timeout: 30) else {
+                    cont.resume(returning: nil); return
                 }
+                var total: UInt64 = 0
+                for line in result.output.components(separatedBy: .newlines) {
+                    if line.hasPrefix("Size = ") {
+                        let numStr = line.replacingOccurrences(of: "Size = ", with: "").trimmingCharacters(in: .whitespaces)
+                        if let s = UInt64(numStr) { total += s }
+                    }
+                }
+                cont.resume(returning: total > 0 ? total : nil)
             }
+        }
+    }
+
+    nonisolated private func runWithTimeout(executable: String, arguments: [String], timeout: Int) -> (output: String, status: Int32)? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            let deadline = DispatchTime.now() + .seconds(timeout)
+            let group = DispatchGroup()
+            group.enter()
+            DispatchQueue.global().async { process.waitUntilExit(); group.leave() }
+            if group.wait(timeout: deadline) == .timedOut {
+                process.terminate()
+                return nil
+            }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            return (String(data: data, encoding: .utf8) ?? "", process.terminationStatus)
+        } catch {
+            return nil
         }
     }
 
     /// 检测压缩文件是否加密
     func isArchiveEncrypted(at path: String) async -> Bool {
         guard let sevenZ = try? locateSevenZ() else { return false }
-
         return await withCheckedContinuation { cont in
             DispatchQueue.global().async {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: sevenZ)
-                process.arguments = ["l", path, "-slt", "-p"]
-
-                let pipe = Pipe()
-                process.standardOutput = pipe
-                process.standardError = Pipe()
-
-                do {
-                    try process.run()
-                    let deadline = DispatchTime.now() + .seconds(10)
-                    let group = DispatchGroup()
-                    group.enter()
-                    DispatchQueue.global().async {
-                        process.waitUntilExit()
-                        group.leave()
-                    }
-                    _ = group.wait(timeout: deadline)
-                    if process.isRunning { process.terminate() }
-
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    let output = String(data: data, encoding: .utf8) ?? ""
-                    cont.resume(returning: output.contains("Encrypted = +"))
-                } catch {
+                if let result = self.runWithTimeout(executable: sevenZ, arguments: ["l", path, "-slt"], timeout: 30) {
+                    cont.resume(returning: result.output.contains("Encrypted = +"))
+                } else {
                     cont.resume(returning: false)
                 }
             }
@@ -265,7 +353,16 @@ actor UnzipService {
             return .failure(UnzipError.extractionFailed(message: error.localizedDescription))
         }
 
-        process.waitUntilExit()
+        // 预检类操作 15 秒超时，避免挂死
+        let isPrecheck = arguments.first == "l" || arguments.first == "t"
+        let deadline = DispatchTime.now() + (isPrecheck ? .seconds(15) : .seconds(600))
+        let group = DispatchGroup()
+        group.enter()
+        DispatchQueue.global().async { process.waitUntilExit(); group.leave() }
+        if group.wait(timeout: deadline) == .timedOut {
+            process.terminate()
+            return .failure(UnzipError.extractionFailed(message: "7z 超时未响应"))
+        }
 
         let data = outputPipe.fileHandleForReading.readDataToEndOfFile()
 

@@ -173,7 +173,6 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 6) {
-            // 拖拽区域提示
             if sourceDirectory == nil {
                 dragHintView
             }
@@ -235,7 +234,19 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - 拖拽处理
+    private var dragHintView: some View {
+        HStack {
+            Image(systemName: "arrow.down.doc")
+                .font(.title2).foregroundColor(.secondary)
+            Text("将文件夹或压缩文件拖拽到此处以选择源目录")
+                .font(.callout).foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 12)
+        .background(Color.gray.opacity(0.04))
+        .cornerRadius(8)
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.15), style: StrokeStyle(lineWidth: 1, dash: [4])))
+    }
 
     private func handleDrop(providers: [NSItemProvider]) {
         for provider in providers {
@@ -255,20 +266,6 @@ struct ContentView: View {
                 }
             }
         }
-    }
-
-    private var dragHintView: some View {
-        HStack {
-            Image(systemName: "arrow.down.doc")
-                .font(.title2).foregroundColor(.secondary)
-            Text("将文件夹或压缩文件拖拽到此处以选择源目录")
-                .font(.callout).foregroundColor(.secondary)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 12)
-        .background(Color.gray.opacity(0.04))
-        .cornerRadius(8)
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.15), style: StrokeStyle(lineWidth: 1, dash: [4])))
     }
 
     // MARK: - 标题
@@ -743,16 +740,27 @@ struct ContentView: View {
             extractDir = output.path(percentEncoded: false)
         }
 
-        // 0. 注册进度条目
+        // 0. 注册进度条目（先用压缩文件大小做初始估计，异步获取精确值）
         let progressId = file.path(percentEncoded: false)
+        let isNative = UnzipService.isNativeFormat(file.path(percentEncoded: false))
+        let archiveSize: UInt64 = {
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: file.path(percentEncoded: false)),
+               let size = attrs[.size] as? UInt64 { return size }
+            return 1
+        }()
         await MainActor.run {
             fileProgresses.removeAll { $0.id == progressId }
-            fileProgresses.append(FileProgress(id: progressId, fileName: archiveName))
+            fileProgresses.append(FileProgress(id: progressId, fileName: archiveName, totalBytes: archiveSize * 3))
         }
-        if let total = await UnzipService.shared.totalUncompressedSize(at: file.path(percentEncoded: false)) {
-            await MainActor.run {
-                if let idx = fileProgresses.firstIndex(where: { $0.id == progressId }) {
-                    fileProgresses[idx].totalBytes = total
+        // 原生格式不跑 7z l（慢），直接用压缩包大小 * 3 估算；7z/rar 异步获取精确值
+        if !isNative {
+            Task {
+                if let total = await UnzipService.shared.totalUncompressedSize(at: file.path(percentEncoded: false)) {
+                    await MainActor.run {
+                        if let idx = fileProgresses.firstIndex(where: { $0.id == progressId }) {
+                            fileProgresses[idx].totalBytes = total
+                        }
+                    }
                 }
             }
         }
@@ -760,27 +768,49 @@ struct ContentView: View {
         var progressTask: Task<Void, Never>? = nil
         func startPolling(_ dir: String) {
             progressTask?.cancel()
-            progressTask = Task { @MainActor in
+            progressTask = Task {
+                let pid = progressId
                 while !Task.isCancelled {
-                    fileProgresses.firstIndex(where: { $0.id == progressId }).map {
-                        let size = dirSize(dir)
-                        fileProgresses[$0].extractedBytes = min(size, fileProgresses[$0].totalBytes)
+                    let size = await Task.detached { dirSize(dir) }.value
+                    await MainActor.run {
+                        if let idx = fileProgresses.firstIndex(where: { $0.id == pid }) {
+                            fileProgresses[idx].extractedBytes = min(size, fileProgresses[idx].totalBytes)
+                        }
                     }
-                    try? await Task.sleep(for: .milliseconds(200))
+                    try? await Task.sleep(for: .milliseconds(500))
                 }
             }
         }
 
-        // 1. 用 7z l 预检是否加密（不挂死），非加密直接解
-        let encrypted = await UnzipService.shared.isArchiveEncrypted(at: file.path(percentEncoded: false))
-
-        if !encrypted {
+        // 1. 直接解压（7z/rar 需预检，系统原生格式跳过）
+        if !isNative {
+            let encrypted = await UnzipService.shared.isArchiveEncrypted(at: file.path(percentEncoded: false))
+            if !encrypted {
+                startPolling(extractDir)
+                do {
+                    let extractedItems = try await UnzipService.shared.extract(archivePath: file.path(percentEncoded: false), outputPath: extractDir)
+                    progressTask?.cancel()
+                    await MainActor.run {
+                        if let idx = fileProgresses.firstIndex(where: { $0.id == progressId }) {
+                            fileProgresses[idx].extractedBytes = fileProgresses[idx].totalBytes
+                        }
+                        addLog("解压成功 (\(extractedItems.count) 个项目)", icon: "✅", color: .green, fileName: archiveName)
+                        successCount += 1
+                    }
+                    await handlePostExtraction(file: file, archiveName: archiveName)
+                    return
+                } catch {
+                    progressTask?.cancel()
+                    await MainActor.run { fileProgresses.removeAll { $0.id == progressId } }
+                    await addLogAsync(error.localizedDescription, icon: "❌", color: .red, fileName: archiveName)
+                    return
+                }
+            }
+        } else {
+            // 系统原生格式直接解压，不预检
             startPolling(extractDir)
             do {
-                let extractedItems = try await UnzipService.shared.extract(
-                    archivePath: file.path(percentEncoded: false),
-                    outputPath: extractDir
-                )
+                let extractedItems = try await UnzipService.shared.extract(archivePath: file.path(percentEncoded: false), outputPath: extractDir)
                 progressTask?.cancel()
                 await MainActor.run {
                     if let idx = fileProgresses.firstIndex(where: { $0.id == progressId }) {
@@ -793,9 +823,12 @@ struct ContentView: View {
                 return
             } catch {
                 progressTask?.cancel()
-                await MainActor.run { fileProgresses.removeAll { $0.id == progressId } }
-                await addLogAsync(error.localizedDescription, icon: "❌", color: .red, fileName: archiveName)
-                return
+                // 只有 ZIP 有加密的可能，才进入密码流程；tar/gz/bz2/xz 不支持加密，直接报错
+                if file.pathExtension.lowercased() != "zip" {
+                    await MainActor.run { fileProgresses.removeAll { $0.id == progressId } }
+                    await addLogAsync(error.localizedDescription, icon: "❌", color: .red, fileName: archiveName)
+                    return
+                }
             }
         }
 
