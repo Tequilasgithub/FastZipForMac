@@ -50,6 +50,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		4FA8C2DF2FAAE6220074773E /* README.md */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = README.md; sourceTree = "<group>"; };
 		4FF206802FA884440007219A /* FinderSyncExt.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = FinderSyncExt.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		F00100000000000000000001 /* FastZipApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FastZipApp.swift; sourceTree = "<group>"; };
 		F00100000000000000000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
@@ -96,6 +97,7 @@
 		G00100000000000000000001 = {
 			isa = PBXGroup;
 			children = (
+				4FA8C2DF2FAAE6220074773E /* README.md */,
 				G00100000000000000000002 /* FastZip */,
 				4FF206812FA884440007219A /* FinderSyncExt */,
 				G00100000000000000000003 /* Products */,
