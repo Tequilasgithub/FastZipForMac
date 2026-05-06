@@ -1,3 +1,5 @@
+//  SPDX-FileCopyrightText: 2026 Tequila <2638884601@qq.com>
+//  SPDX-License-Identifier: GPL-3.0-or-later
 import Foundation
 
 /// 解压服务，负责调用系统上的 7z 命令行工具

@@ -1,3 +1,5 @@
+//  SPDX-FileCopyrightText: 2026 Tequila <2638884601@qq.com>
+//  SPDX-License-Identifier: GPL-3.0-or-later
 import Foundation
 import Security
 
