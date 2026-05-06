@@ -37,4 +37,4 @@ brew install p7zip
 
 ## License
 
-MIT
+GPL-3.0-or-later — 自由使用、修改、分发，衍生作品需同样以 GPL 兼容协议开源。
