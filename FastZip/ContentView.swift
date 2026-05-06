@@ -654,6 +654,12 @@ struct ContentView: View {
         let selected = scannedItems.filter(\.isSelected)
         guard !selected.isEmpty else { return }
 
+        // 检测 7z 是否安装
+        if !UnzipService.isAvailable() {
+            showInstallP7zipAlert()
+            return
+        }
+
         isProcessing = true
         totalCount = selected.count
         processedCount = 0
@@ -1245,6 +1251,48 @@ struct ContentView: View {
         if bytes >= 1_048_576 { return String(format: "%.1f MB", Double(bytes) / 1_048_576) }
         if bytes >= 1024 { return String(format: "%.0f KB", Double(bytes) / 1024) }
         return "\(bytes) B"
+    }
+
+    private func showInstallP7zipAlert() {
+        let alert = NSAlert()
+        alert.messageText = "未找到 7z 解压工具"
+        alert.informativeText = "FastZip 依赖 p7zip 进行压缩文件解压。\n点击「安装」将通过 Homebrew 自动安装 p7zip。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "安装")
+        alert.addButton(withTitle: "取消")
+        if alert.runModal() == .alertFirstButtonReturn {
+            installP7zip()
+        }
+    }
+
+    private func installP7zip() {
+        addLog("开始安装 p7zip...", icon: "📦", color: .blue)
+        Task {
+            // 自动检测 brew 路径（Apple Silicon > Intel > Shell 查找）
+            let brewPaths = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+            var brewPath = "/opt/homebrew/bin/brew"
+            for p in brewPaths where FileManager.default.isExecutableFile(atPath: p) {
+                brewPath = p; break
+            }
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: brewPath)
+            process.arguments = ["install", "p7zip"]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+            do {
+                try process.run()
+                process.waitUntilExit()
+                if process.terminationStatus == 0 {
+                    await addLogAsync("p7zip 安装成功，现在可以解压了", icon: "✅", color: .green)
+                } else {
+                    let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                    await addLogAsync("安装失败: \(out)", icon: "❌", color: .red)
+                }
+            } catch {
+                await addLogAsync("安装出错: \(error.localizedDescription)\n请手动运行: brew install p7zip", icon: "❌", color: .red)
+            }
+        }
     }
 
     private func saveLog() {

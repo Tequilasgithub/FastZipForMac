@@ -308,14 +308,7 @@ enum UnzipError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .sevenZNotFound:
-            return """
-            未找到 7z 命令。
-
-            请先通过 Homebrew 安装 p7zip：
-              brew install p7zip
-
-            安装完成后重启本应用即可。
-            """
+            return "未找到 7z"
         case .extractionFailed(let message):
             return "解压失败：\(message)"
         }
